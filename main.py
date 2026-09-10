@@ -3,6 +3,7 @@ from email.utils import parsedate_to_datetime
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
+import difflib  # 新增：用於標題模糊比對去重
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import requests
@@ -13,7 +14,6 @@ app = FastAPI(title="地區新聞過濾服務")
 # 香港時區 (UTC+8)
 HKT = timezone(timedelta(hours=8))
 
-# 4 大指定新聞來源定義
 TARGET_SOURCES = {
     "HK01": ["hk01.com", "香港01", "hk01"],
     "星島頭條": ["stheadline.com", "星島頭條", "星島日報", "stheadline"],
@@ -29,7 +29,6 @@ DISTRICT_KEYWORDS = [
 
 
 def is_today_hkt(pub_date_str: str) -> bool:
-    """檢查新聞是否在「今日 00:00 至當前 moment」之間發布"""
     if not pub_date_str:
         return False
     try:
@@ -42,13 +41,19 @@ def is_today_hkt(pub_date_str: str) -> bool:
 
 
 def clean_title(title: str) -> str:
-    """清理標題尾巴的媒體後綴，方便比對是否為同一則新聞"""
-    cleaned = re.sub(r'\s*[-|｜]\s*[^||-]+$', '', title)
-    return cleaned.strip()
+    """清理標題尾巴的媒體後綴"""
+    return re.sub(r'\s*[-|｜]\s*[^||-]+$', '', title).strip()
+
+
+def is_similar(t1: str, t2: str) -> bool:
+    """使用 fuzzy match 檢查標題相似度，大於 65% 視為同一則新聞更新"""
+    # 先移除所有空白字元再比對，避免因多按一個空白鍵導致判斷失敗
+    t1_compact = re.sub(r'\s+', '', t1)
+    t2_compact = re.sub(r'\s+', '', t2)
+    return difflib.SequenceMatcher(None, t1_compact, t2_compact).ratio() > 0.65
 
 
 def match_source(title: str, link: str, source_text: str) -> str:
-    """判斷新聞屬於哪一個指定來源"""
     combined = f"{title} {link} {source_text}".lower()
     for source_name, keywords in TARGET_SOURCES.items():
         if any(kw.lower() in combined for kw in keywords):
@@ -58,7 +63,6 @@ def match_source(title: str, link: str, source_text: str) -> str:
 
 @app.get("/api/news")
 def get_today_district_news():
-    # 建立限縮來源的 Google RSS 搜尋語句
     sites_query = " OR ".join([f"site:{k}" for k in ["stheadline.com", "hk01.com", "news.gov.hk", "hk.on.cc"]])
     search_query = f"(九龍灣 OR 牛頭角 OR 啟德) ({sites_query})"
     encoded_query = urllib.parse.quote(search_query)
@@ -76,58 +80,6 @@ def get_today_district_news():
 
     root = ET.fromstring(response.content)
     
-    # 用於比對去重： (來源, 簡化標題) -> 新聞資料
-    latest_news_map = {}
-
-    for item in root.findall(".//item"):
-        title = item.find("title").text if item.find("title") is not None else ""
-        link = item.find("link").text if item.find("link") is not None else ""
-        pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
-        
-        source_elem = item.find("source")
-        source_text = source_elem.text if source_elem is not None else ""
-
-        # 1. 時間過濾：僅留今日 00:00 後發布的新聞
-        if not is_today_hkt(pub_date):
-            continue
-
-        # 2. 來源過濾：必須屬於 4 大來源之一
-        source_name = match_source(title, link, source_text)
-        if not source_name:
-            continue
-
-        # 3. 關鍵字過濾
-        matched_kw = [kw for kw in DISTRICT_KEYWORDS if kw in title]
-        if not matched_kw:
-            continue
-
-        # 4. 新聞去重：若為同一則新聞（簡化標題相同），僅保留最新更新者
-        c_title = clean_title(title)
-        dedup_key = (source_name, c_title)
-        
-        try:
-            pub_dt = parsedate_to_datetime(pub_date)
-        except Exception:
-            pub_dt = datetime.min.replace(tzinfo=timezone.utc)
-
-        news_entry = {
-            "title": title,
-            "clean_title": c_title,
-            "link": link,
-            "pub_date": pub_date,
-            "pub_dt": pub_dt,
-            "source": source_name,
-            "keywords": matched_kw
-        }
-
-        if dedup_key not in latest_news_map:
-            latest_news_map[dedup_key] = news_entry
-        else:
-            # 如果已有紀錄，比較時間，只保留較新的一筆
-            if pub_dt > latest_news_map[dedup_key]["pub_dt"]:
-                latest_news_map[dedup_key] = news_entry
-
-    # 5. 按來源分類整理數據
     categorized_data = {
         "HK01": [],
         "星島頭條": [],
@@ -135,14 +87,67 @@ def get_today_district_news():
         "東方即時新聞": []
     }
 
-    for entry in latest_news_map.values():
-        src = entry["source"]
-        del entry["pub_dt"]  # 移除內部比對用的 datetime 物件
-        categorized_data[src].append(entry)
+    for item in root.findall(".//item"):
+        title = item.find("title").text if item.find("title") is not None else ""
+        link = item.find("link").text if item.find("link") is not None else ""
+        pub_date = item.find("pubDate").text if item.find("pubDate") is not None else ""
+        source_elem = item.find("source")
+        source_text = source_elem.text if source_elem is not None else ""
 
-    # 每個分類內按時間倒序排序（最新的在最前）
+        if not is_today_hkt(pub_date):
+            continue
+
+        source_name = match_source(title, link, source_text)
+        if not source_name:
+            continue
+
+        matched_kw = [kw for kw in DISTRICT_KEYWORDS if kw in title]
+        if not matched_kw:
+            continue
+
+        c_title = clean_title(title)
+        
+        try:
+            pub_dt = parsedate_to_datetime(pub_date)
+            # 轉換為香港時間格式字串 (例：09-10 14:30)
+            formatted_time = pub_dt.astimezone(HKT).strftime("%m-%d %H:%M")
+        except Exception:
+            pub_dt = datetime.min.replace(tzinfo=timezone.utc)
+            formatted_time = pub_date
+
+        news_entry = {
+            "title": title,
+            "clean_title": c_title,
+            "link": link,
+            "pub_date": formatted_time,
+            "pub_dt": pub_dt,
+            "keywords": matched_kw
+        }
+
+        # 4. 模糊比對去重邏輯
+        is_duplicate = False
+        target_list = categorized_data[source_name]
+        
+        for i, existing_entry in enumerate(target_list):
+            if is_similar(c_title, existing_entry["clean_title"]):
+                is_duplicate = True
+                # 若為同一新聞，時間較新者覆蓋；若時間相同，保留標題較長(資訊較多)者
+                if pub_dt > existing_entry["pub_dt"]:
+                    target_list[i] = news_entry
+                elif pub_dt == existing_entry["pub_dt"]:
+                    if len(title) > len(existing_entry["title"]):
+                        target_list[i] = news_entry
+                break
+                
+        if not is_duplicate:
+            target_list.append(news_entry)
+
+    # 按時間排序並清理多餘欄位
     for src in categorized_data:
-        categorized_data[src].sort(key=lambda x: x["pub_date"], reverse=True)
+        categorized_data[src].sort(key=lambda x: x["pub_dt"], reverse=True)
+        for item in categorized_data[src]:
+            del item["pub_dt"]
+            del item["clean_title"]
 
     return {"status": "success", "data": categorized_data}
 
@@ -163,7 +168,7 @@ def home_page():
             <header class="flex justify-between items-center mb-4 bg-white p-4 rounded-2xl shadow-sm">
                 <div>
                     <h1 class="text-xl font-bold text-slate-800">地區新聞速報</h1>
-                    <p class="text-xs text-slate-500">當日新聞 (00:00 - 現在) · 按來源分類</p>
+                    <p class="text-xs text-slate-500">今日 00:00 至今 · 智慧去重版</p>
                 </div>
                 <button onclick="loadNews()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-2 rounded-xl transition">
                     重新整理
@@ -220,7 +225,7 @@ def home_page():
                                             </a>
                                             <div class="flex justify-between items-center text-[10px] text-slate-400">
                                                 <span>關鍵字: ${item.keywords.join(', ')}</span>
-                                                <span>${item.pub_date}</span>
+                                                <span class="bg-slate-100 px-1.5 py-0.5 rounded">${item.pub_date}</span>
                                             </div>
                                         </div>
                                     `).join('') + '</div>'
@@ -240,7 +245,6 @@ def home_page():
     </body>
     </html>
     """
-
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
