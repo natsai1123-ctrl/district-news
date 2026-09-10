@@ -3,7 +3,7 @@ from email.utils import parsedate_to_datetime
 import re
 import urllib.parse
 import xml.etree.ElementTree as ET
-import difflib  # 新增：用於標題模糊比對去重
+import difflib
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse
 import requests
@@ -46,11 +46,10 @@ def clean_title(title: str) -> str:
 
 
 def is_similar(t1: str, t2: str) -> bool:
-    """使用 fuzzy match 檢查標題相似度，大於 65% 視為同一則新聞更新"""
-    # 先移除所有空白字元再比對，避免因多按一個空白鍵導致判斷失敗
+    """使用 fuzzy match 檢查標題相似度，大於 55% 視為同一則新聞更新"""
     t1_compact = re.sub(r'\s+', '', t1)
     t2_compact = re.sub(r'\s+', '', t2)
-    return difflib.SequenceMatcher(None, t1_compact, t2_compact).ratio() > 0.65
+    return difflib.SequenceMatcher(None, t1_compact, t2_compact).ratio() > 0.55
 
 
 def match_source(title: str, link: str, source_text: str) -> str:
@@ -109,7 +108,6 @@ def get_today_district_news():
         
         try:
             pub_dt = parsedate_to_datetime(pub_date)
-            # 轉換為香港時間格式字串 (例：09-10 14:30)
             formatted_time = pub_dt.astimezone(HKT).strftime("%m-%d %H:%M")
         except Exception:
             pub_dt = datetime.min.replace(tzinfo=timezone.utc)
@@ -124,14 +122,14 @@ def get_today_district_news():
             "keywords": matched_kw
         }
 
-        # 4. 模糊比對去重邏輯
+        # 模糊比對去重邏輯 (門檻 > 55%)
         is_duplicate = False
         target_list = categorized_data[source_name]
         
         for i, existing_entry in enumerate(target_list):
             if is_similar(c_title, existing_entry["clean_title"]):
                 is_duplicate = True
-                # 若為同一新聞，時間較新者覆蓋；若時間相同，保留標題較長(資訊較多)者
+                # 若為同一新聞，時間較新者覆蓋；若時間相同，保留標題較長者
                 if pub_dt > existing_entry["pub_dt"]:
                     target_list[i] = news_entry
                 elif pub_dt == existing_entry["pub_dt"]:
@@ -142,7 +140,7 @@ def get_today_district_news():
         if not is_duplicate:
             target_list.append(news_entry)
 
-    # 按時間排序並清理多餘欄位
+    # 按時間排序並清理內部欄位
     for src in categorized_data:
         categorized_data[src].sort(key=lambda x: x["pub_dt"], reverse=True)
         for item in categorized_data[src]:
@@ -168,7 +166,7 @@ def home_page():
             <header class="flex justify-between items-center mb-4 bg-white p-4 rounded-2xl shadow-sm">
                 <div>
                     <h1 class="text-xl font-bold text-slate-800">地區新聞速報</h1>
-                    <p class="text-xs text-slate-500">今日 00:00 至今 · 智慧去重版</p>
+                    <p class="text-xs text-slate-500">今日 00:00 至今 · 智慧去重版 (>55% 相似度)</p>
                 </div>
                 <button onclick="loadNews()" class="bg-blue-600 hover:bg-blue-700 text-white text-xs px-3 py-2 rounded-xl transition">
                     重新整理
